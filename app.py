@@ -23,13 +23,60 @@ TARGET_HEADER = [
 ]
 
 
+import datetime as _dt
+
+
 def load_file(uploaded_file):
-    """Read an uploaded CSV or Excel file into a DataFrame."""
+    """Read an uploaded CSV or Excel file into a DataFrame.
+
+    Deliberately does NOT force dtype=str at read time, because doing so
+    mangles real Excel date/time cells (they get parsed into datetime
+    objects by openpyxl *before* the dtype cast happens, so forcing str
+    afterwards turns a proper date like 09/09/2026 into the ugly ISO form
+    '2026-09-09 00:00:00'). Instead we read with native types and format
+    each cell ourselves in `normalize_dataframe`.
+    """
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
     else:
-        return pd.read_excel(uploaded_file, dtype=str)
+        return pd.read_excel(uploaded_file)
+
+
+def _format_cell(val):
+    """Turn any cell value into the exact text format we want, preserving
+    real dates/times correctly instead of letting them turn into ISO strings.
+    """
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass  # some values (e.g. arrays) can't be checked with pd.isna; fall through
+    if isinstance(val, pd.Timestamp):
+        val = val.to_pydatetime()
+    if isinstance(val, _dt.datetime):
+        if val.time() == _dt.time(0, 0):
+            return val.strftime("%d/%m/%Y")  # pure date -> dd/mm/yyyy
+        return val.strftime("%d/%m/%Y %I:%M:%S %p")  # date+time, just in case
+    if isinstance(val, _dt.date):
+        return val.strftime("%d/%m/%Y")
+    if isinstance(val, _dt.time):
+        return val.strftime("%I:%M:%S %p")
+    if isinstance(val, float):
+        # avoid turning whole numbers like 1.0 into "1.0"
+        if val.is_integer():
+            return str(int(val))
+        return str(val)
+    return str(val).strip()
+
+
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply _format_cell to every cell so Date/Time (and everything else)
+    come out as clean, correct text instead of whatever pandas inferred.
+    """
+    return df.apply(lambda col: col.map(_format_cell))
 
 
 def fix_header(df: pd.DataFrame, target_header: list[str]):
@@ -86,6 +133,7 @@ if uploaded_file is not None:
 
     st.success(f"Loaded **{uploaded_file.name}** — {raw_df.shape[0]} rows, {raw_df.shape[1]} columns")
 
+    raw_df = normalize_dataframe(raw_df)
     fixed_df, missing_cols, extra_cols = fix_header(raw_df, TARGET_HEADER)
 
     col1, col2 = st.columns(2)
