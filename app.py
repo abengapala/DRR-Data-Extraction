@@ -1,14 +1,16 @@
 import streamlit as st
 import pandas as pd
+import re
+import datetime as _dt
 from io import BytesIO
 
-st.set_page_config(page_title="Daily Remark Header Fixer", layout="wide")
+st.set_page_config(page_title="Header Fixer", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Your standard/target header — the order you normally work with.
-# Edit this list directly if your standard header ever changes.
+# Standard/target headers for each report type. Edit these lists directly if
+# a standard header ever changes.
 # ---------------------------------------------------------------------------
-TARGET_HEADER = [
+DAILY_REMARK_HEADER = [
     "S.No", "Date", "Time", "Debtor", "Account No.", "Card No.", "Service No.",
     "DPD", "Call Status", "Status", "Remark", "Remark By", "Remark Type",
     "Field Visit Date", "Collector", "Client", "Product Description",
@@ -22,8 +24,26 @@ TARGET_HEADER = [
     "Legal Status", "Next Legal Follow up",
 ]
 
+AUTOSTAT_HEADER = [
+    "CH CODE", "ACCOUNT NUMBER", "STATUS CODE", "REMARKS", "REMARKS BY",
+    "REMARKS DATE", "PTP DATE", "PTP AMOUNT",
+]
 
-import datetime as _dt
+# Autostat date/time columns need special reformatting (the system expects
+# these exact patterns to recognize the file): REMARKS DATE -> MM/DD/YYYY
+# HH:MM:SS (24-hour), PTP DATE -> MM/DD/YYYY (date only).
+AUTOSTAT_DATETIME_COLS = {"REMARKS DATE": False, "PTP DATE": True}  # value = date_only?
+
+REPORT_CONFIGS = {
+    "Daily Remark": {
+        "target_header": DAILY_REMARK_HEADER,
+        "datetime_cols": {},  # handled generically for this report type
+    },
+    "Autostat": {
+        "target_header": AUTOSTAT_HEADER,
+        "datetime_cols": AUTOSTAT_DATETIME_COLS,
+    },
+}
 
 
 def load_file(uploaded_file):
@@ -44,8 +64,8 @@ def load_file(uploaded_file):
 
 
 def _format_cell(val):
-    """Turn any cell value into the exact text format we want, preserving
-    real dates/times correctly instead of letting them turn into ISO strings.
+    """Turn any cell value into clean text, preserving real dates/times
+    correctly instead of letting them turn into ISO strings.
     """
     if val is None:
         return ""
@@ -65,7 +85,6 @@ def _format_cell(val):
     if isinstance(val, _dt.time):
         return val.strftime("%I:%M:%S %p")
     if isinstance(val, float):
-        # avoid turning whole numbers like 1.0 into "1.0"
         if val.is_integer():
             return str(int(val))
         return str(val)
@@ -79,11 +98,58 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.apply(lambda col: col.map(_format_cell))
 
 
+_TRAILING_AMPM_RE = re.compile(r"\s*(AM|PM)\s*$", re.IGNORECASE)
+
+
+def parse_autostat_datetime(raw, date_only: bool = False) -> str:
+    """Reformat an Autostat date/time value into the exact pattern the
+    system expects: MM/DD/YYYY HH:MM:SS (24-hour), or MM/DD/YYYY for
+    date-only columns.
+
+    Handles the quirky source format seen in raw exports, e.g.
+    '9/14/2026  18:00:00 PM' (double space, 24-hour time with a bogus
+    trailing AM/PM tag) by stripping the bogus AM/PM marker and keeping
+    the 24-hour value as-is, rather than misapplying an AM/PM conversion.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    s = re.sub(r"\s+", " ", s)          # collapse repeated spaces
+    s = _TRAILING_AMPM_RE.sub("", s)     # drop bogus trailing AM/PM tag
+
+    formats = ["%m/%d/%Y"] if date_only else [
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+    ]
+    for fmt in formats:
+        try:
+            dt = _dt.datetime.strptime(s, fmt)
+            return dt.strftime("%m/%d/%Y") if date_only else dt.strftime("%m/%d/%Y %H:%M:%S")
+        except ValueError:
+            continue
+    # last resort: let pandas try to parse it
+    try:
+        dt = pd.to_datetime(s)
+        return dt.strftime("%m/%d/%Y") if date_only else dt.strftime("%m/%d/%Y %H:%M:%S")
+    except Exception:
+        return s  # give up, return original text rather than losing data
+
+
+def apply_datetime_formatting(df: pd.DataFrame, datetime_cols: dict) -> pd.DataFrame:
+    """Reformat specific columns using parse_autostat_datetime, per the
+    report config's datetime_cols mapping of {column_name: date_only_bool}.
+    """
+    for col, date_only in datetime_cols.items():
+        if col in df.columns:
+            df[col] = df[col].map(lambda v: parse_autostat_datetime(v, date_only=date_only))
+    return df
+
+
 def fix_header(df: pd.DataFrame, target_header: list[str]):
     """Reorder/select df's columns to match target_header.
     Returns (fixed_df, missing_cols, extra_cols).
     """
-    # normalize for matching (trim spaces, case-insensitive) but keep original target names
     col_lookup = {str(c).strip().lower(): c for c in df.columns}
 
     missing_cols = []
@@ -110,18 +176,23 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-st.title("📋 Daily Remark Header Fixer")
+st.title("📋 Header Fixer")
 st.caption(
     "Upload the newly downloaded file and this will automatically reorder/align "
-    "its columns to match your standard working header — no more manual copy-pasting."
+    "its columns (and fix date/time formats) to match your standard working header."
 )
 
-with st.expander("Standard header currently in use (edit app.py to change it)"):
-    st.write(f"{len(TARGET_HEADER)} columns:")
-    st.code(", ".join(TARGET_HEADER))
+report_type = st.radio("Which file are you fixing?", list(REPORT_CONFIGS.keys()), horizontal=True)
+config = REPORT_CONFIGS[report_type]
+target_header = config["target_header"]
+datetime_cols = config["datetime_cols"]
+
+with st.expander(f"Standard header currently in use for {report_type} (edit app.py to change it)"):
+    st.write(f"{len(target_header)} columns:")
+    st.code(", ".join(target_header))
 
 uploaded_file = st.file_uploader(
-    "Upload the new data file (.csv or .xlsx)", type=["csv", "xlsx", "xls"]
+    "Upload the new data file (.csv or .xlsx)", type=["csv", "xlsx", "xls"], key=report_type
 )
 
 if uploaded_file is not None:
@@ -134,7 +205,10 @@ if uploaded_file is not None:
     st.success(f"Loaded **{uploaded_file.name}** — {raw_df.shape[0]} rows, {raw_df.shape[1]} columns")
 
     raw_df = normalize_dataframe(raw_df)
-    fixed_df, missing_cols, extra_cols = fix_header(raw_df, TARGET_HEADER)
+    fixed_df, missing_cols, extra_cols = fix_header(raw_df, target_header)
+
+    if datetime_cols:
+        fixed_df = apply_datetime_formatting(fixed_df, datetime_cols)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -161,7 +235,7 @@ if uploaded_file is not None:
     st.download_button(
         label="⬇️ Download fixed file (.xlsx)",
         data=excel_bytes,
-        file_name="Daily_Remark_Fixed.xlsx",
+        file_name=f"{report_type.replace(' ', '_')}_Fixed.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
